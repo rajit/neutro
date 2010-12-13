@@ -41,7 +41,6 @@ class Git {
     }
 
     method clone {
-        say "git clone -q { self.translated_repository } $!path";
         run "git clone -q { self.translated_repository } $!path"
             and die "Couldn't clone { self.translated_repository } to $!path"
     }
@@ -62,6 +61,8 @@ class ModulesDatabase {
     has $!ecosystem_source;
     has $!ecosystem_name;
     has $!src_path;
+    has $!install_file;
+    has %!modules;
 
     method update {
         notice "Updating modules database";
@@ -74,7 +75,13 @@ class ModulesDatabase {
         cp "$path/$!projects_file", "$!path/$!projects_file";
     }
 
-    method fetch (Str $name, Str $url) {
+    multi method fetch (Str $module) {
+        crap "Unknown module $module"
+            unless %!modules.exists: $module;
+        self.fetch: $module, %!modules{$module};
+    }
+
+    multi method fetch (Str $name, Str $url) {
         given $!src_path {
             unless .IO.d { mkdir $_, :p }
         }
@@ -92,6 +99,111 @@ class ModulesDatabase {
             exit 1;
         }
     }
+
+    method list {
+        self.read;
+        .say for %!modules.keys.sort.grep: { $_ };
+    }
+
+    method read {
+        return if %!modules;
+
+        given "$!path/$!projects_file" {
+            unless .IO.f { self.update }
+
+            given open($_) {
+                for .lines -> $line {
+                    next if $line ~~ /^\#/;
+
+                    %!modules.push: $line.split: ' ';
+                }
+                .close;
+            }
+        }
+    }
+
+    method install(Str $module, Bool $strict?, Bool $v?, Bool :$fetch = True) {
+        self.read;
+
+        self.fetch: $module
+            if $fetch;
+
+        self.install_deps: $module;
+
+        notice "Building $module";
+        self.build: $module, :$v;
+
+        notice "Testing $module";
+        self.test: $module, :$strict, :$v;
+
+        notice "Installing $module";
+        self._install: $module, :$v;
+    }
+
+    method install_deps (Str $module) {
+        given "$!src_path/$module/deps.proto" {
+            if .IO.f {
+                my $fh = open $_;
+                for $fh.lines -> $dep {
+                    next if $dep ~~ /^\#/;
+                    next if $dep eq '';
+
+                    unless self.is_installed: $module {
+                        notice "$module depends on $dep, installing now";
+                        self.install: $dep;
+                    }
+                }
+                $fh.close;
+            }
+        }
+    }
+
+    method build (Str $module, Bool :$v) {
+        self.run_or:
+            { Module::Build::build :$v },
+            $module, "Build $module failed";
+    }
+
+    method test (Str $module, Bool :$strict, Bool :$v) {
+        crap "No tests for $module"
+            if $strict and "$!src_path/$module/t".IO.d;
+        self.run_or:
+            { Module::Test::test :$v },
+            $module, "Tests failed for $module";
+    }
+
+    method run_or (Callable $to_run, Str $module, Str $error_message) {
+        my $cwd = cwd;
+        chdir "$!src_path/$module";
+        try {
+            $to_run();
+            CATCH { crap $error_message }
+        }
+        chdir $cwd;
+    }
+
+    method _install (Str $module, Bool :$v) {
+        self.run_or:
+            { Module::Install::install :$v },
+            $module, "Installing $module failed";
+
+        notice "Successfully installed $module";
+        unless self.is_installed($module) {
+            given open($!install_file, :a) {
+                .say: $module;
+                .close;
+            }
+        }
+    }
+
+    method is_installed (Str $module) {
+        my $isit;
+        given open($INSTALLED) {
+            $isit = .lines.first($module).Bool;
+            .close;
+        }
+        return $isit;
+    }
 }
 
 my $db = ModulesDatabase.new(
@@ -99,114 +211,16 @@ my $db = ModulesDatabase.new(
     projects_file => $PROJECTS_FILE,
     ecosystem_source => 'http://github.com/perl6/ecosystem.git',
     ecosystem_name => 'ecosystem',
+    install_file => $INSTALLED,
     src_path => $SRCDIR);
-
-# check if modules list is present, update it otherwise
-sub checklist {
-    unless $CONFIGDIR.IO ~~ :d {
-        mkdir $CONFIGDIR, :p;
-    }
-    unless "$CONFIGDIR/projects.list".IO ~~ :f {
-        $db.update;
-    }
-    unless $INSTALLED.IO ~~ :f {
-        open($INSTALLED, :w).close;
-    }
-    my $fh = open "$CONFIGDIR/projects.list";
-    for $fh.lines -> $line {
-        next if $line ~~ /^\#/;
-        my ($name, $url) = $line.split: ' ';
-        %modules{$name} = $url;
-    }
-    $fh.close;
-}
 
 sub crap (Str $msg) {
     notice $msg;
     exit 1;
 }
 
-sub install (Str $module, Bool $strict?, Bool $v?, Bool :$fetch = True) {
-    my $res;
-    if $fetch {
-        %modules.exists($module) or crap "Unknown module $module";
-        Git.update: %modules{$module}, "$SRCDIR/$module";
-        chdir "$SRCDIR/$module";
-    }
-    installdeps $module;
-    notice "Building $module";
-    my $fail = False;
-    try {
-        Module::Build::build :$v;
-        CATCH {
-            $fail = True;
-        }
-    }
-    crap "Building $module failed" if $fail;
-    # THINKABOUT: what if tests are someplace else?
-    # Everyone's allowed to do it
-    if $strict and 't'.IO !~~ :d {
-        crap "No tests for $module";
-    }
-    notice "Testing $module";
-    try {
-        Module::Test::test :$v;
-        CATCH {
-            $fail = True;
-        }
-    }
-    crap "Tests failed for $module" if $fail;
-    notice "Installing $module";
-    try {
-        Module::Install::install :$v;
-        CATCH {
-            $fail = True;
-        }
-    }
-    crap "Installing $module failed" if $fail;
-    notice "Successfully installed $module";
-
-    unless isinstalled $module {
-        given open($INSTALLED, :a) {
-            .say($module);
-            .close;
-        }
-    }
-}
-
-sub installdeps (Str $name) {
-    my $dir = cwd;
-    if 'deps.proto'.IO ~~ :f {
-        my $fh = open 'deps.proto';
-        for $fh.lines -> $dep {
-            next if $dep ~~ /^\#/;
-            next if $dep eq '';
-            unless isinstalled $dep {
-                notice "$name depends on $dep, installing now";
-                install $dep;
-            }
-        }
-        $fh.close;
-    }
-    chdir $dir;
-}
-
-sub isinstalled (Str $module) {
-    my $isit;
-    given open($INSTALLED) {
-        $isit = .lines.first($module).Bool;
-        .close;
-    }
-    return $isit;
-}
-
-sub listmodules {
-    for %modules.keys.sort.grep({ $_ }) { .say }
-}
-
 multi MAIN ('list') {
-    checklist;
-    listmodules;
+    $db.list;
 }
 
 multi MAIN ('update') {
@@ -214,8 +228,7 @@ multi MAIN ('update') {
 }
 
 multi MAIN ($module, Bool :$strict, Bool :$v) {
-    checklist;
-    install $module, $strict, $v, :fetch($module eq '.' ?? False !! True);
+    $db.install: $module, $strict, $v, :fetch($module eq '.' ?? False !! True);
 }
 
 # vim: ft=perl6
