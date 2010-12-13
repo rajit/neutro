@@ -19,6 +19,43 @@ sub notice (Str $what) {
     say "==> $what";
 }
 
+class Git {
+    has $!path;
+    has $!repository;
+    has $!translated_repository;
+
+    method translated_repository {
+        unless $!translated_repository {
+            $!translated_repository = $!repository.subst: / ^git\:\/\/ /, 'http://';
+        }
+
+        return $!translated_repository;
+    }
+
+    method pull {
+        my $cwd = cwd;
+        chdir $!path;
+        run 'git pull -q'
+            and die "Couldn't pull latest $!path";
+        chdir $cwd;
+    }
+
+    method clone {
+        say "git clone -q { self.translated_repository } $!path";
+        run "git clone -q { self.translated_repository } $!path"
+            and die "Couldn't clone { self.translated_repository } to $!path"
+    }
+
+    method update(Str $url, Str $path) {
+        my $git = Git.new(path => $path, repository => $url);
+
+        given $path {
+            when .IO.d { $git.pull }
+            default { $git.clone }
+        }
+    }
+}
+
 class ModulesDatabase {
     has $!path;
     has $!projects_file;
@@ -39,22 +76,14 @@ class ModulesDatabase {
 
     method fetch (Str $name, Str $url) {
         given $!src_path {
-            unless .IO.d { say "mkdir $_, :p"; mkdir $_, :p }
+            unless .IO.d { mkdir $_, :p }
         }
 
         notice "Fetching $name";
 
         my $full_src = "$!src_path/$name";
 
-        given $full_src {
-            when .IO.d {
-                my $cwd = cwd;
-                chdir $_;
-                run 'git pull -q' and die "Couldn't pull latest $name";
-                chdir $cwd;
-            }
-            default { run "git clone -q $url $_" and die "Couldn't clone $name" }
-        }
+        Git.update($url, $full_src);
 
         return $full_src;
 
@@ -65,13 +94,20 @@ class ModulesDatabase {
     }
 }
 
+my $db = ModulesDatabase.new(
+    path => $CONFIGDIR,
+    projects_file => $PROJECTS_FILE,
+    ecosystem_source => 'http://github.com/perl6/ecosystem.git',
+    ecosystem_name => 'ecosystem',
+    src_path => $SRCDIR);
+
 # check if modules list is present, update it otherwise
 sub checklist {
     unless $CONFIGDIR.IO ~~ :d {
         mkdir $CONFIGDIR, :p;
     }
     unless "$CONFIGDIR/projects.list".IO ~~ :f {
-        updatedb;
+        $db.update;
     }
     unless $INSTALLED.IO ~~ :f {
         open($INSTALLED, :w).close;
@@ -90,27 +126,12 @@ sub crap (Str $msg) {
     exit 1;
 }
 
-sub fetch (Str $name, Str $url) {
-    my $res;
-    mkdir $SRCDIR, :p;
-    chdir $SRCDIR;
-    notice "Fetching $name";
-    if "$SRCDIR/$name".IO ~~ :d {
-        chdir $name;
-        $res = run 'git pull -q';
-        crap "Failed updating the $name repo" if $res;
-    } else {
-        $res = run "git clone -q $url $name";
-        crap "Failed cloning the $name repo" if $res;
-        chdir $name;
-    }
-}
-
 sub install (Str $module, Bool $strict?, Bool $v?, Bool :$fetch = True) {
     my $res;
     if $fetch {
         %modules.exists($module) or crap "Unknown module $module";
-        fetch $module, %modules{$module};
+        Git.update: %modules{$module}, "$SRCDIR/$module";
+        chdir "$SRCDIR/$module";
     }
     installdeps $module;
     notice "Building $module";
@@ -182,23 +203,6 @@ sub isinstalled (Str $module) {
 sub listmodules {
     for %modules.keys.sort.grep({ $_ }) { .say }
 }
-
-sub updatedb {
-    notice 'Updating modules database';
-    my $cwd = cwd;
-    chdir $CONFIGDIR;
-    unlink 'projects.list' if 'projects.list'.IO ~~ :e;
-    fetch 'ecosystem', 'git://github.com/perl6/ecosystem.git';
-    cp 'projects.list', "$CONFIGDIR/projects.list";
-    chdir $cwd;
-}
-
-my $db = ModulesDatabase.new(
-    path => $CONFIGDIR,
-    projects_file => $PROJECTS_FILE,
-    ecosystem_source => 'git://github.com/perl6/ecosystem.git',
-    ecosystem_name => 'ecosystem',
-    src_path => $SRCDIR);
 
 multi MAIN ('list') {
     checklist;
