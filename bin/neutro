@@ -12,7 +12,58 @@ my $CONFIGDIR = "$home/.neutro";
 my $INSTALLDIR = %*ENV<DESTDIR> // "$home/.perl6";
 my $INSTALLED = "$CONFIGDIR/installed";
 my $SRCDIR = "$CONFIGDIR/src";
+my $PROJECTS_FILE = 'projects.list';
 my %modules;
+
+sub notice (Str $what) {
+    say "==> $what";
+}
+
+class ModulesDatabase {
+    has $!path;
+    has $!projects_file;
+    has $!ecosystem_source;
+    has $!ecosystem_name;
+    has $!src_path;
+
+    method update {
+        notice "Updating modules database";
+
+        given "$!src_path/$!projects_file" {
+            when .IO.e { unlink }
+        }
+
+        my $path = self.fetch: $!ecosystem_name, $!ecosystem_source;
+        cp "$path/$!projects_file", "$!path/$!projects_file";
+    }
+
+    method fetch (Str $name, Str $url) {
+        given $!src_path {
+            unless .IO.d { say "mkdir $_, :p"; mkdir $_, :p }
+        }
+
+        notice "Fetching $name";
+
+        my $full_src = "$!src_path/$name";
+
+        given $full_src {
+            when .IO.d {
+                my $cwd = cwd;
+                chdir $_;
+                run 'git pull -q' and die "Couldn't pull latest $name";
+                chdir $cwd;
+            }
+            default { run "git clone -q $url $_" and die "Couldn't clone $name" }
+        }
+
+        return $full_src;
+
+        CATCH {
+            say $!;
+            exit 1;
+        }
+    }
+}
 
 # check if modules list is present, update it otherwise
 sub checklist {
@@ -132,10 +183,6 @@ sub listmodules {
     for %modules.keys.sort.grep({ $_ }) { .say }
 }
 
-sub notice (Str $what) {
-    say "==> $what";
-}
-
 sub updatedb {
     notice 'Updating modules database';
     my $cwd = cwd;
@@ -146,13 +193,20 @@ sub updatedb {
     chdir $cwd;
 }
 
+my $db = ModulesDatabase.new(
+    path => $CONFIGDIR,
+    projects_file => $PROJECTS_FILE,
+    ecosystem_source => 'git://github.com/perl6/ecosystem.git',
+    ecosystem_name => 'ecosystem',
+    src_path => $SRCDIR);
+
 multi MAIN ('list') {
     checklist;
     listmodules;
 }
 
 multi MAIN ('update') {
-    updatedb;
+    $db.update;
 }
 
 multi MAIN ($module, Bool :$strict, Bool :$v) {
